@@ -2347,6 +2347,137 @@ with TAB_STOCK:
                             else:
                                 st.caption("🌊 No unusual activity on this contract.")
 
+                            # ── Quick log: Bought / Skip, right from this contract ──
+                            #
+                            # Everything needed to open a position (ticker, right,
+                            # strike, expiry) is already sitting in `opt` above.
+                            # Before this, logging a trade meant re-typing all of
+                            # that by hand in the Positions tab — friction that
+                            # risks a skipped or mistyped log during the 30-trade
+                            # test, which is exactly what this test can't afford.
+                            # The Positions tab's manual form still exists for
+                            # anything seen outside this view (e.g. via Telegram).
+                            st.divider()
+                            st.markdown("##### Log this contract")
+                            _qkey = f"{ticker}_{opt['expiry']}_{opt['strike']}_{opt['label']}"
+
+                            lc1, lc2 = st.columns(2)
+                            with lc1:
+                                if st.button("✅ Bought this — log position",
+                                            key=f"qbuy_btn_{_qkey}",
+                                            use_container_width=True):
+                                    st.session_state[f"qbuy_open_{_qkey}"] = True
+                                    st.session_state[f"qskip_open_{_qkey}"] = False
+                            with lc2:
+                                if st.button("🚫 Skipping this — log reason",
+                                            key=f"qskip_btn_{_qkey}",
+                                            use_container_width=True):
+                                    st.session_state[f"qskip_open_{_qkey}"] = True
+                                    st.session_state[f"qbuy_open_{_qkey}"] = False
+
+                            if st.session_state.get(f"qbuy_open_{_qkey}"):
+                                with st.container(border=True):
+                                    st.caption(
+                                        f"{ticker} {opt['expiry']} ${opt['strike']:g} "
+                                        f"{opt['label']} · app mid was ${opt['mid']:.2f}"
+                                    )
+                                    bq1, bq2 = st.columns(2)
+                                    with bq1:
+                                        # No default from opt['mid'] on purpose: the
+                                        # 30-trade test is measuring your REAL fill
+                                        # cost against the model's assumed spread.
+                                        # Defaulting to the mid would let a click-
+                                        # through silently corrupt that number.
+                                        q_prem = st.number_input(
+                                            "Your actual fill premium (per share)",
+                                            min_value=0.0, step=0.01, value=0.0,
+                                            key=f"qbuy_prem_{_qkey}",
+                                            help="Type your real fill, not the app's "
+                                                 "quoted mid — that gap IS the data "
+                                                 "this test is measuring.")
+                                        q_qty = st.number_input(
+                                            "Contracts", min_value=1, value=1,
+                                            step=1, key=f"qbuy_qty_{_qkey}")
+                                    with bq2:
+                                        q_tp = st.number_input(
+                                            "Take profit +%", min_value=0, value=200,
+                                            step=25, key=f"qbuy_tp_{_qkey}")
+                                        q_sl = st.number_input(
+                                            "Stop loss −%", min_value=0, max_value=100,
+                                            value=50, step=10, key=f"qbuy_sl_{_qkey}")
+                                        q_dte = st.number_input(
+                                            "Time exit at DTE", min_value=0, value=7,
+                                            step=1, key=f"qbuy_dte_{_qkey}")
+                                        q_thesis = st.checkbox(
+                                            "Thesis invalidation (EMA20)", value=False,
+                                            key=f"qbuy_thesis_{_qkey}",
+                                            help="Off by default — the option backtest "
+                                                 "showed this rule cutting winners.")
+                                    q_notes = st.text_input(
+                                        "Notes", key=f"qbuy_notes_{_qkey}")
+
+                                    if q_prem > 0:
+                                        cost = q_prem * 100 * q_qty
+                                        st.caption(
+                                            f"Total cost **\\${cost:,.0f}** — your "
+                                            f"maximum loss on this contract "
+                                            f"({cost/ACCOUNT_SIZE*100:.1f}% of "
+                                            f"\\${ACCOUNT_SIZE:,}).")
+                                        if not (q_tp or q_sl or q_dte or q_thesis):
+                                            st.error("All exit rules are off — the "
+                                                     "monitor would never alert on "
+                                                     "this position.")
+                                        else:
+                                            if st.button("📍 Confirm — start monitoring",
+                                                        type="primary",
+                                                        key=f"qbuy_confirm_{_qkey}"):
+                                                open_option_position(
+                                                    ticker=ticker, right=opt["label"],
+                                                    strike=opt["strike"],
+                                                    expiry=opt["expiry"],
+                                                    contracts=q_qty,
+                                                    entry_premium=q_prem,
+                                                    rules={"tp_pct": q_tp, "sl_pct": q_sl,
+                                                           "dte_exit": q_dte,
+                                                           "invalidate_ema": q_thesis},
+                                                    notes=q_notes)
+                                                st.session_state[f"qbuy_open_{_qkey}"] = False
+                                                st.success(
+                                                    f"Logged {ticker} {opt['expiry']} "
+                                                    f"${opt['strike']:g} {opt['label']} "
+                                                    f"— now monitoring.")
+                                                st.rerun()
+                                    else:
+                                        st.caption("Enter your fill premium to continue.")
+
+                            if st.session_state.get(f"qskip_open_{_qkey}"):
+                                with st.container(border=True):
+                                    st.caption(
+                                        f"{ticker} {opt['expiry']} ${opt['strike']:g} "
+                                        f"{opt['label']} — logging as skipped"
+                                    )
+                                    q_reason = st.selectbox("Why skip it?", [
+                                        "Contract too expensive for my risk rule",
+                                        "Spread too wide",
+                                        "Didn't like the chart / my own read",
+                                        "Already at max positions",
+                                        "Earnings or event risk",
+                                        "Missed it / saw too late",
+                                        "Daily loss or trade limit reached",
+                                        "Other",
+                                    ], key=f"qskip_reason_{_qkey}")
+                                    q_snotes = st.text_input(
+                                        "Notes (optional)", key=f"qskip_notes_{_qkey}")
+                                    if st.button("🚫 Confirm — log skip",
+                                                key=f"qskip_confirm_{_qkey}"):
+                                        log_skipped_signal(
+                                            ticker=ticker, trend=r["trend"],
+                                            reason=q_reason, notes=q_snotes,
+                                            price=r["price"])
+                                        st.session_state[f"qskip_open_{_qkey}"] = False
+                                        st.success(f"Logged skip: {ticker} — {q_reason}")
+                                        st.rerun()
+
                 with stab4:
                     if intraday is None or len(intraday) < 30:
                         st.warning("Not enough intraday bars (need ≥ 30). "
