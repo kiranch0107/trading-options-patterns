@@ -264,3 +264,132 @@ def scan_rectangles(df: pd.DataFrame, cfg: dict) -> list[dict]:
             r["bar_index"] = i
             hits.append(r)
     return hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FLAG / PENNANT DETECTOR
+# ══════════════════════════════════════════════════════════════════════
+def detect_flag(df: pd.DataFrame, as_of: int,
+                pole_bars: int = 10,
+                flag_bars: int = 8,
+                pole_min_pct: float = 8.0,
+                max_retrace_pct: float = 50.0,
+                max_flag_range_pct: float = 6.0,
+                breakout_buffer_pct: float = 0.3) -> dict | None:
+    """
+    A flag is a sharp directional move (the POLE) followed by a tight
+    consolidation (the FLAG), breaking out in the SAME direction as the pole.
+
+    WHY THIS IS A DIFFERENT TEST FROM RECTANGLES — not a rerun:
+
+    1. CONTINUATION, NOT DIRECTION-AGNOSTIC. A rectangle sits in a range and we
+       trade whichever way it exits, i.e. we predict direction from nothing.
+       Here a move has ALREADY happened and we only trade its resumption. That
+       is a weaker, more modest claim and generally better evidenced.
+
+    2. THE PAYOFF IS ASYMMETRIC BY CONSTRUCTION. Rectangle target = pattern
+       height and stop = pattern height, giving ~1:1 — which is precisely why
+       52.3% wins still lost money there. Here target = POLE height while stop
+       = the flag's tight low, so R:R lands near 3:1 with nothing tightened.
+       The failure mode that killed rectangles does not apply.
+
+    3. NO SWING-POINT DEPENDENCY. Rectangles needed confirmed pivots, which is
+       where the lookahead bug lived. A flag is measured directly from two
+       adjacent bar windows, so that whole class of bug is structurally absent.
+
+    Windows (both STRICTLY before as_of; only as_of's close tests the breakout):
+        pole : [as_of - flag_bars - pole_bars, as_of - flag_bars)
+        flag : [as_of - flag_bars, as_of)
+
+    Rejection criteria are what stop this from firing on noise:
+      - pole move below pole_min_pct        -> a drift, not a pole
+      - flag range wider than max_flag_range_pct -> not a consolidation
+      - retracement beyond max_retrace_pct  -> a reversal, not a pause
+    """
+    flag_start = as_of - flag_bars
+    pole_start = flag_start - pole_bars
+    if pole_start < 0 or as_of >= len(df):
+        return None
+
+    pole = df.iloc[pole_start:flag_start]
+    flag = df.iloc[flag_start:as_of]
+    if len(pole) < pole_bars or len(flag) < flag_bars:
+        return None
+
+    p0 = float(pole["Close"].iloc[0])
+    p1 = float(pole["Close"].iloc[-1])
+    if p0 <= 0:
+        return None
+    pole_ret = (p1 - p0) / p0 * 100
+    if abs(pole_ret) < pole_min_pct:
+        return None
+    direction = "Bullish" if pole_ret > 0 else "Bearish"
+    pole_height = abs(p1 - p0)
+    if pole_height <= 0:
+        return None
+
+    fh = float(flag["High"].max())
+    fl = float(flag["Low"].min())
+    if fl <= 0:
+        return None
+    flag_range_pct = (fh - fl) / fl * 100
+    if flag_range_pct > max_flag_range_pct:
+        return None
+
+    # How much of the pole was given back during the consolidation?
+    if direction == "Bullish":
+        retrace = (p1 - fl) / pole_height * 100
+    else:
+        retrace = (fh - p1) / pole_height * 100
+    if retrace < 0 or retrace > max_retrace_pct:
+        return None
+
+    close = float(df["Close"].iloc[as_of])
+    if direction == "Bullish":
+        if close <= fh * (1 + breakout_buffer_pct / 100):
+            return None
+        entry, stop, target = close, fl, close + pole_height
+        if not (stop < entry < target):
+            return None
+    else:
+        if close >= fl * (1 - breakout_buffer_pct / 100):
+            return None
+        entry, stop, target = close, fh, close - pole_height
+        if not (target < entry < stop):
+            return None
+
+    return {
+        "pattern":        "flag",
+        "direction":      direction,
+        "pole_ret_pct":   round(pole_ret, 2),
+        "pole_height":    round(pole_height, 4),
+        "flag_high":      round(fh, 4),
+        "flag_low":       round(fl, 4),
+        "flag_range_pct": round(flag_range_pct, 2),
+        "retrace_pct":    round(retrace, 1),
+        "entry":          round(entry, 4),
+        "stop":           round(stop, 4),
+        "target":         round(target, 4),
+    }
+
+
+def scan_flags(df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """Run detect_flag() at every bar with enough history."""
+    hits = []
+    pole_bars = cfg.get("pole_bars", 10)
+    flag_bars = cfg.get("flag_bars", 8)
+    start = max(cfg.get("min_bars_before", 70), pole_bars + flag_bars + 1)
+    for i in range(start, len(df)):
+        r = detect_flag(
+            df, i,
+            pole_bars=pole_bars,
+            flag_bars=flag_bars,
+            pole_min_pct=cfg.get("pole_min_pct", 8.0),
+            max_retrace_pct=cfg.get("max_retrace_pct", 50.0),
+            max_flag_range_pct=cfg.get("max_flag_range_pct", 6.0),
+            breakout_buffer_pct=cfg.get("breakout_buffer_pct", 0.3),
+        )
+        if r:
+            r["bar_index"] = i
+            hits.append(r)
+    return hits
