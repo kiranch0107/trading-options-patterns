@@ -79,7 +79,8 @@ def detect_rectangle(df: pd.DataFrame, as_of: int,
                      min_touches: int = 2,
                      min_span_bars: int = 10,
                      breakout_buffer_pct: float = 0.3,
-                     right_bars: int = 3) -> dict | None:
+                     right_bars: int = 3,
+                     stop_mode: str = "far") -> dict | None:
     """
     Look for a horizontal trading range in the `lookback` bars strictly before
     `as_of`, and test whether bar `as_of` is breaking out of it.
@@ -164,18 +165,53 @@ def detect_rectangle(df: pd.DataFrame, as_of: int,
         return None   # inside the range — no breakout yet
 
     height = res_level - sup_level
+
+    # ── STOP CONVENTION ──
+    # "far"  — stop at the OPPOSITE boundary. The classic textbook placement:
+    #          the pattern is only void if price traverses the whole range back.
+    #          Safe from noise, but risk = full pattern height, so with the
+    #          target also one height away the trade is ~1:1. That is what the
+    #          first backtest measured: 52.5% wins yet NEGATIVE expectancy,
+    #          because timeout exits book small gains while stops are full size.
+    #
+    # "near"  — stop just back inside the BROKEN boundary. Also a standard
+    #          convention (a failed breakout is proven by re-entering the
+    #          range), and it cuts risk to roughly the buffer distance, lifting
+    #          R:R toward 3:1+. The cost is more stop-outs on noise.
+    #
+    # Which wins is an empirical question, not a preference — that is the
+    # single comparison this option exists to answer. It is NOT a knob to
+    # sweep alongside tolerance/lookback/min_touches until something turns
+    # positive; with that many degrees of freedom a positive result would be
+    # fitted to this sample and mean nothing.
     if direction == "Bullish":
-        entry  = close
-        stop   = sup_level                     # opposite side of the range
+        entry = close
+        if stop_mode == "near":
+            # just under the broken resistance, offset by the same buffer
+            stop = res_level * (1 - breakout_buffer_pct / 100)
+        else:
+            stop = sup_level                   # opposite side of the range
         target = close + height                # height projected from breakout
     else:
-        entry  = close
-        stop   = res_level
+        entry = close
+        if stop_mode == "near":
+            stop = sup_level * (1 + breakout_buffer_pct / 100)
+        else:
+            stop = res_level
         target = close - height
+
+    # A "near" stop can land on the wrong side of entry if the breakout close
+    # ran a long way past the boundary in one bar. Degenerate levels would
+    # corrupt the R calculation, so reject rather than silently clamp.
+    if direction == "Bullish" and not (stop < entry < target):
+        return None
+    if direction == "Bearish" and not (target < entry < stop):
+        return None
 
     return {
         "pattern":       "rectangle",
         "direction":     direction,
+        "stop_mode":     stop_mode,
         "resistance":    round(res_level, 4),
         "support":       round(sup_level, 4),
         "height":        round(height, 4),
@@ -222,6 +258,7 @@ def scan_rectangles(df: pd.DataFrame, cfg: dict) -> list[dict]:
             min_span_bars=cfg.get("min_span_bars", 10),
             breakout_buffer_pct=cfg.get("breakout_buffer_pct", 0.3),
             right_bars=swing_w,
+            stop_mode=cfg.get("stop_mode", "far"),
         )
         if r:
             r["bar_index"] = i
