@@ -213,6 +213,13 @@ def parse_args() -> dict:
                    default=DEFAULT_PATTERN_CFG["breakout_buffer_pct"])
     p.add_argument("--max-hold", type=int, default=TRADE_CFG["max_hold"])
     p.add_argument("--min-rr", type=float, default=TRADE_CFG["min_rr"])
+    p.add_argument("--stop-mode", choices=["far", "near"], default="far",
+                   help="far = stop at opposite boundary (textbook, ~1:1 R:R). "
+                        "near = stop just inside the broken boundary (~3:1+, "
+                        "but stops out more often).")
+    p.add_argument("--compare-stops", action="store_true",
+                   help="Run BOTH stop conventions and print them side by side. "
+                        "This is the one structural comparison worth making.")
     a = p.parse_args()
 
     return dict(
@@ -223,7 +230,9 @@ def parse_args() -> dict:
             tolerance_pct=a.tolerance, min_touches=a.min_touches,
             min_span_bars=a.min_span, breakout_buffer_pct=a.breakout_buffer,
             min_bars_before=DEFAULT_PATTERN_CFG["min_bars_before"],
+            stop_mode=a.stop_mode,
         ),
+        compare_stops=a.compare_stops,
         trade=dict(
             max_hold=a.max_hold, slippage_bps=TRADE_CFG["slippage_bps"],
             commission=TRADE_CFG["commission"],
@@ -232,5 +241,76 @@ def parse_args() -> dict:
     )
 
 
+def compare_stop_modes(cfg: dict) -> None:
+    """
+    Run both stop conventions on identical detections and compare.
+
+    This is a MECHANISM test, not a parameter sweep. The first backtest showed
+    52.5% wins with negative expectancy — a payoff-structure problem, not
+    obviously a prediction problem. The far stop risks a full pattern height
+    against a one-height target (~1:1); the near stop risks only the buffer
+    (~3:1+) but is hit by noise more often. Whether the better payoff survives
+    the lower win rate is exactly what this measures.
+
+    Read BREADTH (tickers positive) at least as hard as expectancy. A real
+    edge appears in most names; a thin edge in a few is what noise looks like.
+    """
+    rows = []
+    for mode in ("far", "near"):
+        pcfg = dict(cfg["pattern"], stop_mode=mode)
+        all_trades = []
+        for tk in cfg["tickers"]:
+            raw = bt.download(tk, cfg["years"])
+            if raw is None:
+                continue
+            df = bt.compute(raw)
+            if len(df) < bt.MIN_BARS_AFTER:
+                continue
+            tail = raw.tail(len(df)).reset_index(drop=True)
+            for col in ("Open", "Date"):
+                if col in tail.columns:
+                    df[col] = tail[col].values
+            trades = backtest_rectangle_ticker(df, pcfg, cfg["trade"])
+            for t in trades:
+                t["ticker"] = tk
+            all_trades += trades
+
+        s = bt.stats(all_trades)
+        if s.get("trades", 0) == 0:
+            rows.append([mode, 0, "—", "—", "—", "—", "—"])
+            continue
+        npos = sum(1 for tk in cfg["tickers"]
+                   if bt.stats([t for t in all_trades
+                                if t.get("ticker") == tk]).get("avg_r", 0) > 0)
+        nwith = sum(1 for tk in cfg["tickers"]
+                    if bt.stats([t for t in all_trades
+                                 if t.get("ticker") == tk]).get("trades", 0) > 0)
+        rows.append([mode, s["trades"], f"{s['win_rate']:.1f}%",
+                     f"{s['avg_r']:+.3f}", f"{s['total_r']:+.1f}",
+                     f"{s['pf']:.2f}", f"{npos}/{nwith}"])
+
+    print("\n" + "=" * 78)
+    print("STOP CONVENTION COMPARISON")
+    print("=" * 78)
+    print(tabulate(rows, headers=["Stop", "Trades", "Win%", "Avg R",
+                                  "Total R", "PF", "Tickers +"],
+                   tablefmt="simple"))
+    print("""
+  far  = stop at the opposite boundary  (risk = full pattern height, ~1:1)
+  near = stop just inside broken boundary (risk = buffer, ~3:1+, noisier)
+
+  What would count as a real finding: 'near' positive on expectancy AND
+  positive on MOST tickers. If expectancy improves but breadth stays under
+  half, that is a payoff artefact on a signal that still does not predict —
+  and rectangles are tested. Do not proceed to sweep tolerance/lookback/
+  min-touches looking for a better number; with that many knobs across 14
+  tickers you will always find one, and it will not survive out of sample.
+""")
+
+
 if __name__ == "__main__":
-    run(parse_args())
+    _cfg = parse_args()
+    if _cfg.pop("compare_stops", False):
+        compare_stop_modes(_cfg)
+    else:
+        run(_cfg)
