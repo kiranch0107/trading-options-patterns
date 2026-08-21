@@ -67,15 +67,16 @@ TRADE_CFG = dict(
 )
 
 
-def backtest_rectangle_ticker(df: pd.DataFrame, pattern_cfg: dict,
-                              trade_cfg: dict) -> list[dict]:
+def backtest_pattern_ticker(df: pd.DataFrame, pattern_cfg: dict,
+                            trade_cfg: dict, pattern: str = "rectangle") -> list[dict]:
     """
     Mirrors backtest.py's backtest_ticker(), but the "signal" at each bar comes
     from the rectangle detector instead of evaluate_signal(). Cooldown after a
     trade is enforced the same way, so overlapping detections on the same
     breakout don't get double-counted.
     """
-    hits = pt.scan_rectangles(df, pattern_cfg)
+    hits = (pt.scan_flags(df, pattern_cfg) if pattern == "flag"
+            else pt.scan_rectangles(df, pattern_cfg))
     hits_by_bar = {h["bar_index"]: h for h in hits}
 
     trades = []
@@ -100,9 +101,14 @@ def backtest_rectangle_ticker(df: pd.DataFrame, pattern_cfg: dict,
     return trades
 
 
+# Back-compat alias — earlier code and any saved commands still call this.
+def backtest_rectangle_ticker(df, pattern_cfg, trade_cfg):
+    return backtest_pattern_ticker(df, pattern_cfg, trade_cfg, "rectangle")
+
+
 def run(cfg: dict) -> None:
     print("=" * 78)
-    print("RECTANGLE PATTERN BACKTEST")
+    print(f"{cfg.get('which','rectangle').upper()} PATTERN BACKTEST")
     print("=" * 78)
     print(f"Tickers    : {', '.join(cfg['tickers'])}")
     print(f"History    : {cfg['years']} years daily")
@@ -135,7 +141,8 @@ def run(cfg: dict) -> None:
             if col in tail.columns:
                 df[col] = tail[col].values
 
-        trades = backtest_rectangle_ticker(df, cfg["pattern"], cfg["trade"])
+        trades = backtest_pattern_ticker(df, cfg["pattern"], cfg["trade"],
+                                         cfg.get("which", "rectangle"))
         s = bt.stats(trades)
         all_trades.extend(trades)
 
@@ -217,6 +224,17 @@ def parse_args() -> dict:
                    help="far = stop at opposite boundary (textbook, ~1:1 R:R). "
                         "near = stop just inside the broken boundary (~3:1+, "
                         "but stops out more often).")
+    p.add_argument("--pattern", choices=["rectangle", "flag"],
+                   default="rectangle",
+                   help="Which pattern family to test.")
+    p.add_argument("--pole-bars", type=int, default=10)
+    p.add_argument("--flag-bars", type=int, default=8)
+    p.add_argument("--pole-min", type=float, default=8.0,
+                   help="Minimum %% move to count as a pole")
+    p.add_argument("--max-retrace", type=float, default=50.0,
+                   help="Max %% of the pole given back during the flag")
+    p.add_argument("--max-flag-range", type=float, default=6.0,
+                   help="Max %% width of the consolidation")
     p.add_argument("--compare-stops", action="store_true",
                    help="Run BOTH stop conventions and print them side by side. "
                         "This is the one structural comparison worth making.")
@@ -231,7 +249,11 @@ def parse_args() -> dict:
             min_span_bars=a.min_span, breakout_buffer_pct=a.breakout_buffer,
             min_bars_before=DEFAULT_PATTERN_CFG["min_bars_before"],
             stop_mode=a.stop_mode,
+            pole_bars=a.pole_bars, flag_bars=a.flag_bars,
+            pole_min_pct=a.pole_min, max_retrace_pct=a.max_retrace,
+            max_flag_range_pct=a.max_flag_range,
         ),
+        which=a.pattern,
         compare_stops=a.compare_stops,
         trade=dict(
             max_hold=a.max_hold, slippage_bps=TRADE_CFG["slippage_bps"],
@@ -270,7 +292,8 @@ def compare_stop_modes(cfg: dict) -> None:
             for col in ("Open", "Date"):
                 if col in tail.columns:
                     df[col] = tail[col].values
-            trades = backtest_rectangle_ticker(df, pcfg, cfg["trade"])
+            trades = backtest_pattern_ticker(df, pcfg, cfg["trade"],
+                                             cfg.get("which", "rectangle"))
             for t in trades:
                 t["ticker"] = tk
             all_trades += trades
