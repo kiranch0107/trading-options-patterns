@@ -83,6 +83,88 @@
         }
       },
       "verdict": "NO EDGE"
+    },
+    {
+      "family": "rectangle-stop-mode",
+      "registered_at": "2026-08-28T20:42:30.864752+00:00",
+      "status": "complete",
+      "config_hash": "0d452b32d52ffa75",
+      "frozen": {
+        "pattern_cfg": {
+          "swing_window": 3,
+          "lookback": 60,
+          "tolerance_pct": 1.5,
+          "min_touches": 2,
+          "min_span_bars": 10,
+          "breakout_buffer_pct": 0.3,
+          "min_bars_before": 70
+        },
+        "trade_cfg": {
+          "max_hold": 20,
+          "slippage_bps": 2.0,
+          "commission": 0.0,
+          "cooldown_bars": 3,
+          "min_rr": 0.5
+        },
+        "tickers": [
+          "AAPL",
+          "AMD",
+          "AMZN",
+          "BABA",
+          "CSCO",
+          "GOOGL",
+          "INTC",
+          "META",
+          "MSFT",
+          "NFLX",
+          "NVDA",
+          "QQQ",
+          "ROKU",
+          "TSLA"
+        ],
+        "years": 15
+      },
+      "criteria": {
+        "min_trades": 60,
+        "min_profit_factor": 1.3,
+        "min_expectancy_r": 0.2,
+        "require_ci_above_zero": true,
+        "min_tickers_positive_frac": 0.5
+      },
+      "tests_completed_before_this": 1,
+      "corrected_alpha": 0.02532,
+      "note": "mechanism test: far vs near stop. 3 detectors have now shown >52% wins with negative expectancy, pointing at payoff structure rather than entries",
+      "completed_at": "2026-08-28T20:44:48.334665+00:00",
+      "result": {
+        "trades": 2787,
+        "profit_factor": 1.03,
+        "expectancy_r": 0.009,
+        "ci_low": 0.009,
+        "tickers_positive_frac": 0.571
+      },
+      "checks": {
+        "trades": {
+          "pass": true,
+          "detail": "2787 vs 60 min"
+        },
+        "profit_factor": {
+          "pass": false,
+          "detail": "1.03 vs 1.3 min"
+        },
+        "expectancy_r": {
+          "pass": false,
+          "detail": "0.009 vs 0.2 min"
+        },
+        "tickers_positive": {
+          "pass": true,
+          "detail": "0.571 vs 0.5 min"
+        },
+        "ci_above_zero": {
+          "pass": true,
+          "detail": "CI low 0.009"
+        }
+      },
+      "verdict": "NO EDGE"
     }
   ],
   "created": "2026-08-28T20:35:06.699615+00:00"
