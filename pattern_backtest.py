@@ -75,8 +75,13 @@ def backtest_pattern_ticker(df: pd.DataFrame, pattern_cfg: dict,
     trade is enforced the same way, so overlapping detections on the same
     breakout don't get double-counted.
     """
-    hits = (pt.scan_flags(df, pattern_cfg) if pattern == "flag"
-            else pt.scan_rectangles(df, pattern_cfg))
+    # Registry dispatch — patterns.SCANNERS is the single place a detector is
+    # registered. The old ternary here meant every new pattern required an
+    # edit in this file AND in --pattern's choices list, which is how a
+    # detector ends up importable, tested, and silently unreachable from the
+    # CLI. An unknown name now raises rather than falling through to
+    # rectangle, so a typo fails instead of quietly measuring the wrong thing.
+    hits = pt.scan(pattern, df, pattern_cfg)
     hits_by_bar = {h["bar_index"]: h for h in hits}
 
     trades = []
@@ -224,7 +229,7 @@ def parse_args() -> dict:
                    help="far = stop at opposite boundary (textbook, ~1:1 R:R). "
                         "near = stop just inside the broken boundary (~3:1+, "
                         "but stops out more often).")
-    p.add_argument("--pattern", choices=["rectangle", "flag"],
+    p.add_argument("--pattern", choices=sorted(pt.SCANNERS),
                    default="rectangle",
                    help="Which pattern family to test.")
     p.add_argument("--pole-bars", type=int, default=10)
