@@ -393,3 +393,502 @@ def scan_flags(df: pd.DataFrame, cfg: dict) -> list[dict]:
             r["bar_index"] = i
             hits.append(r)
     return hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRENDLINE FITTING — shared machinery for channels and triangles
+# ══════════════════════════════════════════════════════════════════════
+def fit_trendline(idx: list[int], vals: np.ndarray
+                  ) -> tuple[float, float, float] | None:
+    """
+    Least-squares line through (idx, vals). Returns (slope, intercept, r2).
+
+    Slope is per bar, so it is directly comparable across tickers only after
+    normalising by price — callers do that, not this function.
+
+    r2 is what keeps a "trendline" from being a line drawn through scatter.
+    Any three points admit a least-squares fit; only a high r2 means the
+    points actually lie on it. This is the single guard that stops trendlines
+    from being as subjective as the head-and-shoulders patterns this module
+    deliberately excludes: the fit quality is measured, not eyeballed.
+    """
+    if len(idx) < 2:
+        return None
+    x = np.asarray(idx, dtype=float)
+    y = np.asarray(vals, dtype=float)
+    if len(idx) == 2:
+        # Two points define a line exactly; r2 is meaningless, report 1.0.
+        if x[1] == x[0]:
+            return None
+        slope = (y[1] - y[0]) / (x[1] - x[0])
+        return float(slope), float(y[0] - slope * x[0]), 1.0
+    slope, intercept = np.polyfit(x, y, 1)
+    pred = slope * x + intercept
+    ss_res = float(np.sum((y - pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    if ss_tot <= 0:
+        return None
+    return float(slope), float(intercept), float(1 - ss_res / ss_tot)
+
+
+def _line_at(slope: float, intercept: float, x: int) -> float:
+    return slope * x + intercept
+
+
+def _confirmed(swings: list[int], lo: int, as_of: int, lag: int) -> list[int]:
+    """
+    Swings usable at `as_of`: inside the window AND whose confirming bar has
+    already printed. Same rule detect_rectangle() enforces — a swing at i is
+    only knowable once bar i+lag exists, so i+lag < as_of is required.
+    """
+    return [i for i in swings if lo <= i and i + lag < as_of]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRENDLINE CHANNEL BREAK DETECTOR
+# ══════════════════════════════════════════════════════════════════════
+def detect_trendline(df: pd.DataFrame, as_of: int,
+                     swing_high_idx: list[int], swing_low_idx: list[int],
+                     lookback: int = 60,
+                     min_touches: int = 3,
+                     min_r2: float = 0.85,
+                     min_slope_pct: float = 0.05,
+                     breakout_buffer_pct: float = 0.3,
+                     right_bars: int = 3,
+                     min_span_bars: int = 15) -> dict | None:
+    """
+    A sloped channel: price bounded by a fitted line through swing highs and
+    another through swing lows, broken at `as_of`.
+
+    This is the sloped generalisation of detect_rectangle(). A rectangle is
+    the special case where both slopes are ~0, which is why the level, touch
+    and buffer conventions below deliberately mirror it.
+
+    WHY THIS ONE EARNS ITS PLACE
+    ------------------------------
+    A trendline is usually the most subjective thing on a chart — two people
+    drawing "the" downtrend line on the same chart get different lines,
+    because they choose which highs to connect. That subjectivity is exactly
+    why this module excludes head-and-shoulders.
+
+    What removes it here: the anchors are not chosen. Every confirmed swing in
+    the window is used, the fit is least-squares over all of them, and `min_r2`
+    rejects the fit outright if those points do not actually lie on a line.
+    There is no discretion left for a result to hide in.
+
+    Definition:
+      - Take confirmed swing highs and lows within [as_of - lookback, as_of).
+      - Need >= min_touches on EACH side.
+      - Fit a line to each; both must clear min_r2.
+      - Both slopes must share sign (a channel, not a wedge — converging
+        lines are the triangle detector's job) and exceed min_slope_pct per
+        bar in magnitude, so a flat range is left to detect_rectangle().
+      - Upper line must sit above the lower line at as_of.
+      - Break: as_of's Close outside the projected channel by more than
+        breakout_buffer_pct.
+
+    NO LOOKAHEAD: identical confirmation rule to detect_rectangle() — a swing
+    at i is used only when i + right_bars < as_of.
+
+    Returns None if no valid channel or no break at `as_of`.
+    """
+    lo_bound = max(0, as_of - lookback)
+    highs_in = _confirmed(swing_high_idx, lo_bound, as_of, right_bars)
+    lows_in = _confirmed(swing_low_idx, lo_bound, as_of, right_bars)
+    if len(highs_in) < min_touches or len(lows_in) < min_touches:
+        return None
+
+    span = as_of - min(highs_in + lows_in)
+    if span < min_span_bars:
+        return None
+
+    up = fit_trendline(highs_in, df["High"].values[highs_in])
+    dn = fit_trendline(lows_in, df["Low"].values[lows_in])
+    if up is None or dn is None:
+        return None
+    up_slope, up_int, up_r2 = up
+    dn_slope, dn_int, dn_r2 = dn
+    if up_r2 < min_r2 or dn_r2 < min_r2:
+        return None
+
+    close = float(df["Close"].iloc[as_of])
+    if close <= 0:
+        return None
+
+    # Slope expressed as % of price per bar, so the threshold means the same
+    # thing on a $15 stock and a $900 one.
+    up_slope_pct = up_slope / close * 100
+    dn_slope_pct = dn_slope / close * 100
+    if abs(up_slope_pct) < min_slope_pct or abs(dn_slope_pct) < min_slope_pct:
+        return None                      # too flat — that is a rectangle
+    if (up_slope > 0) != (dn_slope > 0):
+        return None                      # converging/diverging — not a channel
+
+    upper = _line_at(up_slope, up_int, as_of)
+    lower = _line_at(dn_slope, dn_int, as_of)
+    if upper <= lower:
+        return None
+
+    buf_up = upper * (1 + breakout_buffer_pct / 100)
+    buf_dn = lower * (1 - breakout_buffer_pct / 100)
+    if close > buf_up:
+        direction = "Bullish"
+    elif close < buf_dn:
+        direction = "Bearish"
+    else:
+        return None                      # still inside the channel
+
+    height = upper - lower
+
+    # Stop at the opposite channel line, target one channel height projected —
+    # the same convention detect_rectangle() uses in "far" mode, kept identical
+    # so results are comparable across detectors rather than reflecting two
+    # different trade-management schemes.
+    if direction == "Bullish":
+        entry, stop, target = close, lower, close + height
+        if not (stop < entry < target):
+            return None
+    else:
+        entry, stop, target = close, upper, close - height
+        if not (target < entry < stop):
+            return None
+
+    return {
+        "pattern":        "trendline",
+        "direction":      direction,
+        "upper_at_break": round(upper, 4),
+        "lower_at_break": round(lower, 4),
+        "upper_slope_pct": round(up_slope_pct, 4),
+        "lower_slope_pct": round(dn_slope_pct, 4),
+        "upper_r2":       round(up_r2, 3),
+        "lower_r2":       round(dn_r2, 3),
+        "height":         round(height, 4),
+        "span_bars":      span,
+        "res_touches":    len(highs_in),
+        "sup_touches":    len(lows_in),
+        "entry":          round(entry, 4),
+        "stop":           round(stop, 4),
+        "target":         round(target, 4),
+    }
+
+
+def scan_trendlines(df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """Run detect_trendline() at every bar with enough history."""
+    swing_w = cfg.get("swing_window", 3)
+    swing_high, swing_low = find_swing_points(df, left=swing_w, right=swing_w)
+    hits = []
+    start = cfg.get("min_bars_before", 70)
+    for i in range(start, len(df)):
+        r = detect_trendline(
+            df, i, swing_high, swing_low,
+            lookback=cfg.get("lookback", 60),
+            min_touches=cfg.get("min_touches", 3),
+            min_r2=cfg.get("min_r2", 0.85),
+            min_slope_pct=cfg.get("min_slope_pct", 0.05),
+            breakout_buffer_pct=cfg.get("breakout_buffer_pct", 0.3),
+            right_bars=swing_w,
+            min_span_bars=cfg.get("min_span_bars", 15),
+        )
+        if r:
+            r["bar_index"] = i
+            hits.append(r)
+    return hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRIANGLE DETECTOR — converging trendlines
+# ══════════════════════════════════════════════════════════════════════
+def detect_triangle(df: pd.DataFrame, as_of: int,
+                    swing_high_idx: list[int], swing_low_idx: list[int],
+                    lookback: int = 60,
+                    min_touches: int = 3,
+                    min_r2: float = 0.85,
+                    min_convergence: float = 0.4,
+                    breakout_buffer_pct: float = 0.3,
+                    right_bars: int = 3,
+                    min_span_bars: int = 15) -> dict | None:
+    """
+    Converging trendlines: the upper line falls, the lower line rises, or one
+    is flat while the other closes on it. Broken at `as_of`.
+
+    Shares all fitting machinery with detect_trendline(); the only difference
+    is the slope relationship demanded. A channel keeps a constant width, a
+    triangle's width shrinks — so `min_convergence` requires the width at
+    as_of to be meaningfully smaller than the width at the window's start.
+    That single number is what separates the two, and it is measured rather
+    than asserted.
+
+    Sub-type is reported for analysis but NOT used to gate anything:
+      ascending  — flat top, rising bottom
+      descending — falling top, flat bottom
+      symmetric  — both sloping toward each other
+
+    Classic technical analysis assigns each sub-type a directional bias
+    (ascending is "bullish"). This detector deliberately does not: whether
+    that bias is real is exactly the question the backtest exists to answer,
+    and encoding it here would smuggle the conclusion into the measurement.
+    Direction comes from which side actually breaks.
+
+    Target convention: the height of the triangle at its widest point,
+    projected from the breakout — the standard measured move, and the same
+    "project the pattern's height" rule the rectangle and channel use.
+    """
+    lo_bound = max(0, as_of - lookback)
+    highs_in = _confirmed(swing_high_idx, lo_bound, as_of, right_bars)
+    lows_in = _confirmed(swing_low_idx, lo_bound, as_of, right_bars)
+    if len(highs_in) < min_touches or len(lows_in) < min_touches:
+        return None
+
+    start_bar = min(highs_in + lows_in)
+    span = as_of - start_bar
+    if span < min_span_bars:
+        return None
+
+    up = fit_trendline(highs_in, df["High"].values[highs_in])
+    dn = fit_trendline(lows_in, df["Low"].values[lows_in])
+    if up is None or dn is None:
+        return None
+    up_slope, up_int, up_r2 = up
+    dn_slope, dn_int, dn_r2 = dn
+    if up_r2 < min_r2 or dn_r2 < min_r2:
+        return None
+
+    width_start = _line_at(up_slope, up_int, start_bar) - _line_at(dn_slope, dn_int, start_bar)
+    width_now = _line_at(up_slope, up_int, as_of) - _line_at(dn_slope, dn_int, as_of)
+    if width_start <= 0 or width_now <= 0:
+        return None
+    # Must have narrowed to at most min_convergence of its starting width.
+    if width_now / width_start > min_convergence:
+        return None
+
+    close = float(df["Close"].iloc[as_of])
+    if close <= 0:
+        return None
+    upper = _line_at(up_slope, up_int, as_of)
+    lower = _line_at(dn_slope, dn_int, as_of)
+
+    up_slope_pct = up_slope / close * 100
+    dn_slope_pct = dn_slope / close * 100
+    flat = 0.02          # % of price per bar below which a line counts as flat
+    if abs(up_slope_pct) < flat and dn_slope_pct > flat:
+        subtype = "ascending"
+    elif abs(dn_slope_pct) < flat and up_slope_pct < -flat:
+        subtype = "descending"
+    elif up_slope_pct < -flat and dn_slope_pct > flat:
+        subtype = "symmetric"
+    else:
+        return None      # not actually converging in a recognised way
+
+    buf_up = upper * (1 + breakout_buffer_pct / 100)
+    buf_dn = lower * (1 - breakout_buffer_pct / 100)
+    if close > buf_up:
+        direction = "Bullish"
+    elif close < buf_dn:
+        direction = "Bearish"
+    else:
+        return None
+
+    height = width_start          # widest point — the measured move
+    if direction == "Bullish":
+        entry, stop, target = close, lower, close + height
+        if not (stop < entry < target):
+            return None
+    else:
+        entry, stop, target = close, upper, close - height
+        if not (target < entry < stop):
+            return None
+
+    return {
+        "pattern":        "triangle",
+        "direction":      direction,
+        "subtype":        subtype,
+        "upper_at_break": round(upper, 4),
+        "lower_at_break": round(lower, 4),
+        "width_start":    round(width_start, 4),
+        "width_now":      round(width_now, 4),
+        "convergence":    round(width_now / width_start, 3),
+        "upper_r2":       round(up_r2, 3),
+        "lower_r2":       round(dn_r2, 3),
+        "height":         round(height, 4),
+        "span_bars":      span,
+        "res_touches":    len(highs_in),
+        "sup_touches":    len(lows_in),
+        "entry":          round(entry, 4),
+        "stop":           round(stop, 4),
+        "target":         round(target, 4),
+    }
+
+
+def scan_triangles(df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """Run detect_triangle() at every bar with enough history."""
+    swing_w = cfg.get("swing_window", 3)
+    swing_high, swing_low = find_swing_points(df, left=swing_w, right=swing_w)
+    hits = []
+    start = cfg.get("min_bars_before", 70)
+    for i in range(start, len(df)):
+        r = detect_triangle(
+            df, i, swing_high, swing_low,
+            lookback=cfg.get("lookback", 60),
+            min_touches=cfg.get("min_touches", 3),
+            min_r2=cfg.get("min_r2", 0.85),
+            min_convergence=cfg.get("min_convergence", 0.4),
+            breakout_buffer_pct=cfg.get("breakout_buffer_pct", 0.3),
+            right_bars=swing_w,
+            min_span_bars=cfg.get("min_span_bars", 15),
+        )
+        if r:
+            r["bar_index"] = i
+            hits.append(r)
+    return hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DOUBLE TOP / BOTTOM DETECTOR
+# ══════════════════════════════════════════════════════════════════════
+def detect_double(df: pd.DataFrame, as_of: int,
+                  swing_high_idx: list[int], swing_low_idx: list[int],
+                  lookback: int = 60,
+                  peak_tolerance_pct: float = 2.0,
+                  min_separation_bars: int = 8,
+                  min_depth_pct: float = 3.0,
+                  breakout_buffer_pct: float = 0.3,
+                  right_bars: int = 3) -> dict | None:
+    """
+    Two swings at a similar level with a meaningful trough (or peak) between
+    them, confirmed by price breaking the neckline at `as_of`.
+
+    Included where head-and-shoulders is excluded because the fuzzy part of
+    H&S is the THIRD peak — "is the middle one clearly higher, are the
+    shoulders similar enough" has no non-arbitrary answer. With two peaks the
+    definition collapses to two numbers: how close in price the peaks must be
+    (peak_tolerance_pct) and how deep the trough between them (min_depth_pct).
+    Both are measured, neither is judged.
+
+    The neckline is the trough between the two peaks (or the peak between two
+    troughs) — unambiguous with only two extremes, which is precisely what
+    makes H&S's neckline contentious and this one not.
+
+    Target: the pattern height (peak to neckline) projected from the neckline
+    break — same measured-move convention as every other detector here.
+    """
+    lo_bound = max(0, as_of - lookback)
+    highs_in = _confirmed(swing_high_idx, lo_bound, as_of, right_bars)
+    lows_in = _confirmed(swing_low_idx, lo_bound, as_of, right_bars)
+    close = float(df["Close"].iloc[as_of])
+    if close <= 0:
+        return None
+
+    highs = df["High"].values
+    lows = df["Low"].values
+
+    # ── DOUBLE TOP (bearish): two similar peaks, break BELOW the trough ──
+    if len(highs_in) >= 2:
+        p2, p1 = highs_in[-1], highs_in[-2]
+        if p2 - p1 >= min_separation_bars:
+            v1, v2 = float(highs[p1]), float(highs[p2])
+            level = (v1 + v2) / 2
+            if level > 0 and abs(v1 - v2) / level * 100 <= peak_tolerance_pct:
+                between = [i for i in lows_in if p1 < i < p2]
+                if between:
+                    neck_i = min(between, key=lambda i: lows[i])
+                    neck = float(lows[neck_i])
+                    depth = (level - neck) / level * 100
+                    if depth >= min_depth_pct:
+                        if close < neck * (1 - breakout_buffer_pct / 100):
+                            height = level - neck
+                            entry, stop, target = close, level, close - height
+                            if target < entry < stop:
+                                return {
+                                    "pattern": "double", "direction": "Bearish",
+                                    "subtype": "double_top",
+                                    "peak_1": round(v1, 4), "peak_2": round(v2, 4),
+                                    "neckline": round(neck, 4),
+                                    "peak_diff_pct": round(abs(v1 - v2) / level * 100, 2),
+                                    "depth_pct": round(depth, 2),
+                                    "separation_bars": p2 - p1,
+                                    "height": round(height, 4),
+                                    "span_bars": as_of - p1,
+                                    "entry": round(entry, 4),
+                                    "stop": round(stop, 4),
+                                    "target": round(target, 4),
+                                }
+
+    # ── DOUBLE BOTTOM (bullish): two similar troughs, break ABOVE the peak ──
+    if len(lows_in) >= 2:
+        t2, t1 = lows_in[-1], lows_in[-2]
+        if t2 - t1 >= min_separation_bars:
+            v1, v2 = float(lows[t1]), float(lows[t2])
+            level = (v1 + v2) / 2
+            if level > 0 and abs(v1 - v2) / level * 100 <= peak_tolerance_pct:
+                between = [i for i in highs_in if t1 < i < t2]
+                if between:
+                    neck_i = max(between, key=lambda i: highs[i])
+                    neck = float(highs[neck_i])
+                    depth = (neck - level) / level * 100
+                    if depth >= min_depth_pct:
+                        if close > neck * (1 + breakout_buffer_pct / 100):
+                            height = neck - level
+                            entry, stop, target = close, level, close + height
+                            if stop < entry < target:
+                                return {
+                                    "pattern": "double", "direction": "Bullish",
+                                    "subtype": "double_bottom",
+                                    "peak_1": round(v1, 4), "peak_2": round(v2, 4),
+                                    "neckline": round(neck, 4),
+                                    "peak_diff_pct": round(abs(v1 - v2) / level * 100, 2),
+                                    "depth_pct": round(depth, 2),
+                                    "separation_bars": t2 - t1,
+                                    "height": round(height, 4),
+                                    "span_bars": as_of - t1,
+                                    "entry": round(entry, 4),
+                                    "stop": round(stop, 4),
+                                    "target": round(target, 4),
+                                }
+    return None
+
+
+def scan_doubles(df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """Run detect_double() at every bar with enough history."""
+    swing_w = cfg.get("swing_window", 3)
+    swing_high, swing_low = find_swing_points(df, left=swing_w, right=swing_w)
+    hits = []
+    start = cfg.get("min_bars_before", 70)
+    for i in range(start, len(df)):
+        r = detect_double(
+            df, i, swing_high, swing_low,
+            lookback=cfg.get("lookback", 60),
+            peak_tolerance_pct=cfg.get("peak_tolerance_pct", 2.0),
+            min_separation_bars=cfg.get("min_separation_bars", 8),
+            min_depth_pct=cfg.get("min_depth_pct", 3.0),
+            breakout_buffer_pct=cfg.get("breakout_buffer_pct", 0.3),
+            right_bars=swing_w,
+        )
+        if r:
+            r["bar_index"] = i
+            hits.append(r)
+    return hits
+
+
+# ══════════════════════════════════════════════════════════════════════
+# REGISTRY — the single place a detector is registered
+# ══════════════════════════════════════════════════════════════════════
+# Adding a pattern means adding ONE line here. pattern_backtest.py reads this
+# dict for both its dispatch and its --pattern choices, so a new detector
+# needs no edit outside this file. The previous ternary dispatch in
+# pattern_backtest.py meant every new pattern touched two files, which is how
+# a detector ends up runnable but silently missing from the CLI.
+SCANNERS = {
+    "rectangle": scan_rectangles,
+    "flag":      scan_flags,
+    "trendline": scan_trendlines,
+    "triangle":  scan_triangles,
+    "double":    scan_doubles,
+}
+
+
+def scan(pattern: str, df: pd.DataFrame, cfg: dict) -> list[dict]:
+    """Dispatch to a registered detector. Raises on an unknown name."""
+    if pattern not in SCANNERS:
+        raise ValueError(f"unknown pattern {pattern!r}; "
+                         f"registered: {', '.join(sorted(SCANNERS))}")
+    return SCANNERS[pattern](df, cfg)
